@@ -22,7 +22,7 @@ var qs = []*survey.Question{
 	{
 		Name: "consumer_id",
 		Prompt: &survey.Input{
-			Message: "Consumer group to move",
+			Message: "Consumer group to move:",
 		},
 		Validate: survey.Required,
 	},
