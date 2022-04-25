@@ -4,18 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/AlecAivazis/survey/v2"
-	manager "github.com/rohilsurana/kafka-consumer-offset/kafka"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/AlecAivazis/survey/v2"
+	manager "github.com/rohilsurana/kafka-offset/kafka"
 )
 
 var qs = []*survey.Question{
 	{
 		Name: "brokers",
 		Prompt: &survey.Input{
-			Message: "Comma seperated kafka broker string:",
+			Message: "Comma separated kafka broker string:",
 			Default: "localhost:9092",
 		},
 	},
@@ -88,7 +89,27 @@ func main() {
 
 	if answers.DryRun {
 		fmt.Println("list of topics and partitions:")
-		printJson(topicPartitionList)
+		printJSON(topicPartitionList)
+	}
+
+	consumerOffsets, err := km.GetConsumerOffsets(ctx, answers.ConsumerID, topicPartitionList)
+	if err != nil {
+		panic(err)
+	}
+
+	if answers.DryRun {
+		fmt.Println("current consumer offsets:")
+		printJSON(consumerOffsets)
+	}
+
+	offsetTimestamps, err := km.GetOffsetTimestamps(ctx, consumerOffsets)
+	if err != nil {
+		panic(err)
+	}
+
+	if answers.DryRun {
+		fmt.Println("current offset timestamps:")
+		printJSON(offsetTimestamps)
 	}
 
 	topicPartitionOffsets, err := km.GetTopicPartitionOffsetsForTimestamp(ctx, topicPartitionList, answers.Timestamp)
@@ -98,7 +119,7 @@ func main() {
 
 	if answers.DryRun {
 		fmt.Println("list of offsets:")
-		printJson(topicPartitionOffsets)
+		printJSON(topicPartitionOffsets)
 	}
 
 	if !answers.DryRun {
@@ -111,8 +132,11 @@ func main() {
 	}
 }
 
-func printJson(v any) {
-	j, _ := json.Marshal(v)
+func printJSON(v any) {
+	j, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println(string(j))
 	fmt.Println("")
 }

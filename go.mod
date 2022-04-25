@@ -1,4 +1,4 @@
-module github.com/rohilsurana/kafka-consumer-offset
+module github.com/rohilsurana/kafka-offset
 
 go 1.18
 
