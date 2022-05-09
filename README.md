@@ -6,12 +6,7 @@ moving offsets of a consumer to offsets near a specific timestamp.
 ## How to use
 
 ```sh
-$ go run main.go
-? Comma seperated kafka broker string: localhost:9092
-? Consumer group to move: testgroup
-? Kafka topic pattern regex: .*-log$
-? Timestamp in milliseconds to move the consumer offsets to: 1650532536000
-? Perform a dry run to print change details: Yes
+$ 
 ```
 
 ### Understanding how it works

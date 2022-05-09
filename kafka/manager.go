@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,50 +19,72 @@ import (
 	"golang.org/x/exp/maps"
 )
 
-const HostnameRegex = `^([a-zA-Z0-9]{1}[a-zA-Z0-9_-]{0,62}){1}(\.[a-zA-Z0-9_]{1}[a-zA-Z0-9_-]{0,62})*?$`
+const hostnameRegex = `^([a-zA-Z0-9]{1}[a-zA-Z0-9_-]{0,62}){1}(\.[a-zA-Z0-9_]{1}[a-zA-Z0-9_-]{0,62})*?$`
+
+type Config struct {
+	Brokers          string
+	DialTimeout      time.Duration
+	IdleTimeout      time.Duration
+	MetadataTTL      time.Duration
+	ResponseTimeout  time.Duration
+	ResponseMinBytes int64
+	ResponseMaxBytes int64
+	KafkaClientID    string
+}
 
 type Manager struct {
 	client *kafka.Client
+	config Config
 }
 
-func NewManager(brokers string, timeout int64) (*Manager, error) {
-	brokerList := strings.Split(brokers, ",")
+func GetDefaultConfig() *Config {
+	programName := filepath.Base(os.Args[0])
+	hostname, _ := os.Hostname()
+
+	return &Config{
+		DialTimeout:      500 * time.Millisecond,
+		IdleTimeout:      500 * time.Millisecond,
+		MetadataTTL:      5 * time.Second,
+		ResponseTimeout:  10 * time.Second,
+		ResponseMinBytes: 1,
+		ResponseMaxBytes: 1e6,
+		KafkaClientID:    fmt.Sprintf("%s@%s (github.com/rohilsurana/kafka-offset)", programName, hostname),
+	}
+}
+
+func NewManager(config Config) (*Manager, error) {
+	brokerList := strings.Split(config.Brokers, ",")
 	for _, broker := range brokerList {
 		if !isHostnamePort(broker) {
 			return nil, errors.New("invalid brokers string")
 		}
 	}
 
-	timeoutDuration := time.Duration(timeout * int64(time.Second))
 	transport := &kafka.Transport{
-		Dial:        (&net.Dialer{Timeout: timeoutDuration}).DialContext,
-		DialTimeout: timeoutDuration,
-		IdleTimeout: timeoutDuration,
-		MetadataTTL: timeoutDuration,
-		ClientID:    kafka.DefaultClientID,
+		Dial:        (&net.Dialer{Timeout: config.DialTimeout}).DialContext,
+		DialTimeout: config.DialTimeout,
+		IdleTimeout: config.IdleTimeout,
+		MetadataTTL: config.MetadataTTL,
+		ClientID:    config.KafkaClientID,
 		Resolver:    kafka.NewBrokerResolver(nil),
 	}
 
 	client := &kafka.Client{
-		Addr:      kafka.TCP(brokers),
+		Addr:      kafka.TCP(brokerList...),
 		Transport: transport,
-		Timeout:   timeoutDuration,
+		Timeout:   config.ResponseTimeout,
 	}
 
 	return &Manager{
 		client: client,
+		config: config,
 	}, nil
 }
 
-func (m Manager) GetTopicPartitionList(ctx context.Context, topicPattern string) (map[string][]int, error) {
+func (m Manager) GetTopicPartitionList(ctx context.Context, topicRegex regexp.Regexp) (map[string][]int, error) {
 	topicsMap := map[string][]int{}
 
-	topicRegex, err := regexp.Compile(topicPattern)
-	if err != nil {
-		return nil, fmt.Errorf("invalid topic pattern: %w", err)
-	}
-
-	ts, err := topics.ListRe(ctx, m.client, topicRegex)
+	ts, err := topics.ListRe(ctx, m.client, &topicRegex)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch topics list: %w", err)
 	}
@@ -97,15 +121,15 @@ func (m Manager) IsConsumerDeadOrEmpty(ctx context.Context, consumerID string) (
 	return false, nil
 }
 
-func (m Manager) GetTopicPartitionOffsetsForTimestamp(ctx context.Context, topicPartitions map[string][]int, timestampMs int64) (map[string]map[int]int64, error) {
+func (m Manager) GetTopicPartitionOffsetsForTimestampMapping(ctx context.Context, topicPartitionTimestamps map[string]map[int]time.Time) (map[string]map[int]int64, error) {
 	topicPartitionOffsets := map[string]map[int]int64{}
 	offsetRequest := map[string][]kafka.OffsetRequest{}
 
-	for t, partitions := range topicPartitions {
-		for _, partition := range partitions {
+	for t, partitionTimestamps := range topicPartitionTimestamps {
+		for partition, timestamp := range partitionTimestamps {
 			offsetRequest[t] = append(offsetRequest[t], kafka.OffsetRequest{
 				Partition: partition,
-				Timestamp: timestampMs,
+				Timestamp: timestamp.UnixMilli(),
 			})
 		}
 	}
@@ -135,13 +159,25 @@ func (m Manager) GetTopicPartitionOffsetsForTimestamp(ctx context.Context, topic
 	return topicPartitionOffsets, nil
 }
 
+func (m Manager) GetTopicPartitionOffsetsForTimestamp(ctx context.Context, topicPartitions map[string][]int, timestampMs int64) (map[string]map[int]int64, error) {
+	topicPartitionTimestamps := map[string]map[int]time.Time{}
+
+	for t, partitions := range topicPartitions {
+		topicPartitionTimestamps[t] = map[int]time.Time{}
+		for _, partition := range partitions {
+			topicPartitionTimestamps[t][partition] = time.UnixMilli(timestampMs)
+		}
+	}
+
+	return m.GetTopicPartitionOffsetsForTimestampMapping(ctx, topicPartitionTimestamps)
+}
+
 func (m Manager) GetConsumerOffsets(ctx context.Context, consumerID string, topics map[string][]int) (map[string]map[int]int64, error) {
 	consumerOffsets := map[string]map[int]int64{}
 	offsetFetchResponse, err := m.client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{
 		GroupID: consumerID,
 		Topics:  topics,
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch consumer offsets: %w", err)
 	}
@@ -173,11 +209,10 @@ func (m Manager) GetOffsetTimestamps(ctx context.Context, topicPartitionOffsets 
 						Topic:     topic,
 						Partition: partition,
 						Offset:    offset,
-						MinBytes:  1,
-						MaxBytes:  2e6,
-						MaxWait:   10 * time.Second,
+						MinBytes:  m.config.ResponseMinBytes,
+						MaxBytes:  m.config.ResponseMaxBytes,
+						MaxWait:   m.config.ResponseTimeout,
 					})
-
 					if err != nil {
 						return
 					}
@@ -230,8 +265,12 @@ func (m Manager) MoveConsumerOffsets(ctx context.Context, consumerID string, top
 		ID:      consumerID,
 		Topics:  topicList,
 		Brokers: []string{m.client.Addr.String()},
-		Dialer:  kafka.DefaultDialer,
-		Timeout: m.client.Timeout,
+		Dialer: &kafka.Dialer{
+			ClientID:  m.config.KafkaClientID,
+			Timeout:   m.config.ResponseTimeout,
+			DualStack: true,
+		},
+		Timeout: m.config.ResponseTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to create consumer instance: %w", err)
@@ -262,7 +301,7 @@ func isHostnamePort(val string) bool {
 	}
 
 	if host != "" {
-		return regexp.MustCompile(HostnameRegex).MatchString(host)
+		return regexp.MustCompile(hostnameRegex).MatchString(host)
 	}
 	return true
 }
