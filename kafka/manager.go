@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,7 +44,7 @@ func GetDefaultConfig() *Config {
 		DialTimeout:      500 * time.Millisecond,
 		IdleTimeout:      500 * time.Millisecond,
 		MetadataTTL:      5 * time.Second,
-		ResponseTimeout:  10 * time.Second,
+		ResponseTimeout:  30 * time.Second,
 		ResponseMinBytes: 1,
 		ResponseMaxBytes: 1e6,
 		KafkaClientID:    fmt.Sprintf("%s@%s (github.com/rohilsurana/kafka-offset)", programName, hostname),
@@ -121,8 +120,9 @@ func (m Manager) IsConsumerDeadOrEmpty(ctx context.Context, consumerID string) (
 	return false, nil
 }
 
-func (m Manager) GetTopicPartitionOffsetsForTimestampMapping(ctx context.Context, topicPartitionTimestamps map[string]map[int]time.Time) (map[string]map[int]int64, error) {
+func (m Manager) GetTopicPartitionOffsetsForTimestampMapping(ctx context.Context, topicPartitionTimestamps map[string]map[int]time.Time) (map[string]map[int]int64, []string, error) {
 	topicPartitionOffsets := map[string]map[int]int64{}
+	var offsetNotFoundTopics []string
 	offsetRequest := map[string][]kafka.OffsetRequest{}
 
 	for t, partitionTimestamps := range topicPartitionTimestamps {
@@ -138,7 +138,7 @@ func (m Manager) GetTopicPartitionOffsetsForTimestampMapping(ctx context.Context
 		Topics: offsetRequest,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("unable to fetch offsets for given topic partitions: %w", err)
+		return nil, nil, fmt.Errorf("unable to fetch offsets for given topic partitions: %w", err)
 	}
 
 	for topic, offset := range offsets.Topics {
@@ -146,20 +146,23 @@ func (m Manager) GetTopicPartitionOffsetsForTimestampMapping(ctx context.Context
 
 		for _, po := range offset {
 			offsetList := maps.Keys(po.Offsets)
-			topicPartitionOffsets[topic][po.Partition] = offsetList[0]
-
 			for _, o := range offsetList {
-				if o < topicPartitionOffsets[topic][po.Partition] {
+				if _, ok := topicPartitionOffsets[topic][po.Partition]; !ok {
+					topicPartitionOffsets[topic][po.Partition] = o
+				} else if o < topicPartitionOffsets[topic][po.Partition] {
 					topicPartitionOffsets[topic][po.Partition] = o
 				}
 			}
 		}
+		if len(topicPartitionOffsets[topic]) == 0 {
+			offsetNotFoundTopics = append(offsetNotFoundTopics, topic)
+		}
 	}
 
-	return topicPartitionOffsets, nil
+	return topicPartitionOffsets, offsetNotFoundTopics, nil
 }
 
-func (m Manager) GetTopicPartitionOffsetsForTimestamp(ctx context.Context, topicPartitions map[string][]int, timestampMs int64) (map[string]map[int]int64, error) {
+func (m Manager) GetTopicPartitionOffsetsForTimestamp(ctx context.Context, topicPartitions map[string][]int, timestampMs int64) (map[string]map[int]int64, []string, error) {
 	topicPartitionTimestamps := map[string]map[int]time.Time{}
 
 	for t, partitions := range topicPartitions {
@@ -217,7 +220,7 @@ func (m Manager) GetOffsetTimestamps(ctx context.Context, topicPartitionOffsets 
 						return
 					}
 
-					minTime := time.Unix(math.MaxInt64, 0)
+					var minTime int64 = -1
 					recCount := 0
 					for {
 						rec, err := fetchResponse.Records.ReadRecord()
@@ -225,16 +228,19 @@ func (m Manager) GetOffsetTimestamps(ctx context.Context, topicPartitionOffsets 
 							break
 						}
 						recCount++
-						if rec.Time.Unix() < minTime.Unix() {
-							minTime = rec.Time
+						if minTime == -1 {
+							minTime = rec.Time.Unix()
+						}
+						if rec.Time.Unix() < minTime {
+							minTime = rec.Time.Unix()
 						}
 					}
 					if recCount == 0 {
-						minTime = time.Unix(0, 0)
+						minTime = 0
 					}
 
-					topicOffsetTimestampsC[topic].Store(partition, minTime)
 					if offset < 0 || recCount > 0 {
+						topicOffsetTimestampsC[topic].Store(partition, time.UnixMilli(minTime))
 						break
 					}
 				}
@@ -254,7 +260,7 @@ func (m Manager) GetOffsetTimestamps(ctx context.Context, topicPartitionOffsets 
 	return topicOffsetTimestamps, nil
 }
 
-func (m Manager) MoveConsumerOffsets(ctx context.Context, consumerID string, topicPartitionOffsets map[string]map[int]int64) error {
+func (m Manager) SetConsumerOffsets(ctx context.Context, consumerID string, topicPartitionOffsets map[string]map[int]int64) error {
 	topicList := maps.Keys(topicPartitionOffsets)
 
 	if consumerID == "" {

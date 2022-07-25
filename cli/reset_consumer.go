@@ -16,7 +16,7 @@ import (
 
 type resetConsumerConfig struct {
 	SourceKafka               *manager.Config
-	ConsumerGroupID           string         `desc:"kafka consumer group"`
+	SourceConsumerGroupID     string         `desc:"kafka consumer group"`
 	SkipConsumerLivenessCheck bool           `desc:"check to verify if all consumer instances are dead or not"`
 	ConsumerLivenessPollTime  time.Duration  `desc:"time between each consumer liveness check"`
 	Before                    time.Duration  `desc:"duration to seek consumer back in time"`
@@ -34,12 +34,12 @@ func cmdResetConsumer(ctx context.Context) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:     "reset-consumer",
-		Short:   "reset consumer to a given timestamp for provided topic pattern",
+		Short:   "Reset consumer to a given timestamp for provided topic pattern",
 		Aliases: []string{"reset", "rc"},
 	}
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		if cfg.ConsumerGroupID == "" {
+		if cfg.SourceConsumerGroupID == "" {
 			return errors.New("consumer group id can't be empty")
 		}
 
@@ -67,7 +67,7 @@ func resetConsumer(ctx context.Context, cfg resetConsumerConfig) error {
 	seekTime := time.Now().Add(-1 * cfg.Before)
 
 	for !cfg.SkipConsumerLivenessCheck {
-		doe, err := km.IsConsumerDeadOrEmpty(ctx, cfg.ConsumerGroupID)
+		doe, err := km.IsConsumerDeadOrEmpty(ctx, cfg.SourceConsumerGroupID)
 		if err != nil {
 			return err
 		} else if doe {
@@ -90,7 +90,7 @@ func resetConsumer(ctx context.Context, cfg resetConsumerConfig) error {
 		printJSON(topicPartitionList)
 	}
 
-	consumerOffsets, err := km.GetConsumerOffsets(ctx, cfg.ConsumerGroupID, topicPartitionList)
+	consumerOffsets, err := km.GetConsumerOffsets(ctx, cfg.SourceConsumerGroupID, topicPartitionList)
 	if err != nil {
 		return err
 	}
@@ -100,9 +100,14 @@ func resetConsumer(ctx context.Context, cfg resetConsumerConfig) error {
 		printJSON(consumerOffsets)
 	}
 
-	topicPartitionOffsets, err := km.GetTopicPartitionOffsetsForTimestamp(ctx, topicPartitionList, seekTime.UnixMilli())
+	topicPartitionOffsets, offsetNotFoundTopics, err := km.GetTopicPartitionOffsetsForTimestamp(ctx, topicPartitionList, seekTime.UnixMilli())
 	if err != nil {
 		return err
+	}
+
+	if len(offsetNotFoundTopics) > 0 {
+		fmt.Println("offsets could not be found for these topics:")
+		printJSON(offsetNotFoundTopics)
 	}
 
 	if !cfg.Execute {
@@ -111,7 +116,7 @@ func resetConsumer(ctx context.Context, cfg resetConsumerConfig) error {
 	}
 
 	if cfg.Execute {
-		if err = km.MoveConsumerOffsets(ctx, cfg.ConsumerGroupID, topicPartitionOffsets); err != nil {
+		if err = km.SetConsumerOffsets(ctx, cfg.SourceConsumerGroupID, topicPartitionOffsets); err != nil {
 			return err
 		}
 		fmt.Println("consumer offsets are set!")

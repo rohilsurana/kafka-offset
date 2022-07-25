@@ -7,10 +7,8 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use: "kafka-offset",
-	Long: `Entropy is a framework to safely and predictably create, change, 
-and improve modern cloud applications and infrastructure using 
-familiar languages, tools, and engineering practices.`,
+	Use:  "kafka-offset",
+	Long: `kafka-offset tool can be used to manipulate kafka consumer group offsets`,
 }
 
 func Execute(ctx context.Context) {

@@ -16,12 +16,13 @@ import (
 type copyConsumerConfig struct {
 	SourceKafka               *manager.Config
 	TargetKafka               *manager.Config
-	ConsumerGroupID           string         `desc:"kafka consumer group"`
+	SourceConsumerGroupID     string         `desc:"kafka consumer group on source kafka"`
+	TargetConsumerGroupID     string         `desc:"kafka consumer group on target kafka"`
 	SkipConsumerLivenessCheck bool           `desc:"check to verify if all consumer instances are dead or not on the target kafka"`
 	ConsumerLivenessPollTime  time.Duration  `desc:"time between each consumer liveness check"`
 	Buffer                    time.Duration  `desc:"duration of buffer to add while copying consumer group offsets to target to account for any delay like due to mirroring"`
-	TopicPattern              *regexp.Regexp `desc:"topic pattern to match list of topics for which the consumer groups offsets will be moved"`
-	Execute                   bool           `desc:"perform execution to actually reset consumer offsets. If unset, only does a dry run"`
+	TopicPattern              *regexp.Regexp `desc:"topic pattern to match list of topics for which the consumer groups offsets will be copied"`
+	Execute                   bool           `desc:"perform execution to actually copy consumer offsets. If unset, only does a dry run"`
 }
 
 func cmdCopyConsumer(ctx context.Context) *cobra.Command {
@@ -31,18 +32,22 @@ func cmdCopyConsumer(ctx context.Context) *cobra.Command {
 		Execute:                   false,
 		ConsumerLivenessPollTime:  10 * time.Second,
 		SkipConsumerLivenessCheck: false,
-		Buffer:                    1 * time.Minute,
+		Buffer:                    0,
 	}
 
 	cmd := &cobra.Command{
 		Use:     "copy-consumer",
-		Short:   "copy consumer from source kafka to target kafka",
+		Short:   "Copy consumer from source kafka to target kafka",
 		Aliases: []string{"copy", "cc"},
 	}
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		if cfg.ConsumerGroupID == "" {
-			return errors.New("consumer group id can't be empty")
+		if cfg.SourceConsumerGroupID == "" {
+			return errors.New("source consumer group id can't be empty")
+		}
+
+		if cfg.TargetConsumerGroupID == "" {
+			return errors.New("target consumer group id can't be empty")
 		}
 
 		return copyConsumer(ctx, cfg)
@@ -77,7 +82,7 @@ func copyConsumer(ctx context.Context, cfg copyConsumerConfig) error {
 		printJSON(topicPartitionList)
 	}
 
-	consumerOffsets, err := skm.GetConsumerOffsets(ctx, cfg.ConsumerGroupID, topicPartitionList)
+	consumerOffsets, err := skm.GetConsumerOffsets(ctx, cfg.SourceConsumerGroupID, topicPartitionList)
 	if err != nil {
 		return err
 	}
@@ -109,7 +114,7 @@ func copyConsumer(ctx context.Context, cfg copyConsumerConfig) error {
 	}
 
 	for !cfg.SkipConsumerLivenessCheck {
-		doe, err := tkm.IsConsumerDeadOrEmpty(ctx, cfg.ConsumerGroupID)
+		doe, err := tkm.IsConsumerDeadOrEmpty(ctx, cfg.TargetConsumerGroupID)
 		if err != nil {
 			return err
 		} else if doe {
@@ -122,9 +127,14 @@ func copyConsumer(ctx context.Context, cfg copyConsumerConfig) error {
 		time.Sleep(10 * time.Second)
 	}
 
-	topicPartitionOffsets, err := tkm.GetTopicPartitionOffsetsForTimestampMapping(ctx, offsetTimestamps)
+	topicPartitionOffsets, offsetNotFoundTopics, err := tkm.GetTopicPartitionOffsetsForTimestampMapping(ctx, offsetTimestamps)
 	if err != nil {
 		return err
+	}
+
+	if len(offsetNotFoundTopics) > 0 {
+		fmt.Println("offsets could not be found for these topics on target kafka:")
+		printJSON(offsetNotFoundTopics)
 	}
 
 	if !cfg.Execute {
@@ -133,7 +143,7 @@ func copyConsumer(ctx context.Context, cfg copyConsumerConfig) error {
 	}
 
 	if cfg.Execute {
-		if err = tkm.MoveConsumerOffsets(ctx, cfg.ConsumerGroupID, topicPartitionOffsets); err != nil {
+		if err = tkm.SetConsumerOffsets(ctx, cfg.TargetConsumerGroupID, topicPartitionOffsets); err != nil {
 			return err
 		}
 		fmt.Println("consumer copied to target kafka!")
